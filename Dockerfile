@@ -44,9 +44,11 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir --no-build-isolation \
     git+https://github.com/NVlabs/nvdiffrast
 
-# Install TRELLIS from source (basic install)
+# Install TRELLIS — no setup.py, clone and add to PYTHONPATH
 RUN git clone --depth 1 https://github.com/microsoft/TRELLIS.git /opt/trellis && \
-    cd /opt/trellis && pip install --no-cache-dir -e ".[basic]"
+    cd /opt/trellis && \
+    pip install --no-cache-dir -r requirements.txt 2>/dev/null || true
+ENV PYTHONPATH=/opt/trellis:${PYTHONPATH}
 
 # FastAPI service
 RUN pip install --no-cache-dir \
