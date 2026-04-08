@@ -5,6 +5,9 @@ ENV PYTHONUNBUFFERED=1
 ENV HF_HOME=/models/huggingface
 ENV TORCH_HOME=/models/torch
 ENV CUDA_HOME=/usr/local/cuda
+# Build nvdiffrast for these arches without needing a GPU present during build.
+# Covers Turing/Ampere/Ada/Hopper + PTX fallback for forward compat (Blackwell).
+ENV TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0+PTX"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-dev python3-venv \
