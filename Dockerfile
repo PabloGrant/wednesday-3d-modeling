@@ -14,7 +14,7 @@ RUN pip install --no-cache-dir \
     torch==2.5.1 torchvision==0.20.1 \
     --index-url https://download.pytorch.org/whl/cu124
 
-# TRELLIS core dependencies
+# TRELLIS core dependencies (nvdiffrast has no PyPI wheel — install from source)
 RUN pip install --no-cache-dir \
     easydict \
     omegaconf \
@@ -24,12 +24,13 @@ RUN pip install --no-cache-dir \
     plyfile \
     "trimesh[all]" \
     xatlas \
-    nvdiffrast \
     "transformers>=4.40.0" \
     accelerate \
     diffusers \
     huggingface_hub \
     spconv-cu120
+
+RUN pip install --no-cache-dir git+https://github.com/NVlabs/nvdiffrast
 
 # Install TRELLIS from source (basic install — no heavy optional CUDA extensions)
 RUN git clone --depth 1 https://github.com/microsoft/TRELLIS.git /opt/trellis && \
