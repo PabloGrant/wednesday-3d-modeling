@@ -1,0 +1,26 @@
+services:
+  wednesday-3d:
+    build: .
+    image: wednesday-3d-modeling:latest
+    container_name: wednesday-3d-modeling
+    ports:
+      - "5309:5309"
+    volumes:
+      - wednesday_3d_models:/models
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - HF_HOME=/models/huggingface
+      - TORCH_HOME=/models/torch
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  wednesday_3d_models:
+    name: wednesday_3d_models
