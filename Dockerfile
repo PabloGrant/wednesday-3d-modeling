@@ -30,7 +30,7 @@ RUN pip install --no-cache-dir \
     huggingface_hub \
     spconv-cu120
 
-RUN pip install --no-cache-dir git+https://github.com/NVlabs/nvdiffrast
+RUN pip install --no-cache-dir --no-build-isolation git+https://github.com/NVlabs/nvdiffrast
 
 # Install TRELLIS from source (basic install — no heavy optional CUDA extensions)
 RUN git clone --depth 1 https://github.com/microsoft/TRELLIS.git /opt/trellis && \
