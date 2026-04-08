@@ -1,7 +1,6 @@
 services:
   wednesday-3d:
-    build: .
-    image: wednesday-3d-modeling:latest
+    image: ghcr.io/pablogrant/wednesday-3d-modeling:latest
     container_name: wednesday-3d-modeling
     ports:
       - "5309:5309"
