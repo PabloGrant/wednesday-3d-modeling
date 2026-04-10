@@ -217,6 +217,82 @@ def _run_generation_safe(task_id: str, img_path: str, fmt: str, original_filenam
                 task["error"] = str(e)
 
 
+def _run_conversion(task_id: str, glb_path: str, fmt: str, original_filename: str):
+    """Convert an existing GLB to obj or fbx. No GPU needed."""
+    task = tasks[task_id]
+    out_path = None
+    try:
+        stem = Path(original_filename).stem
+
+        if fmt == "obj":
+            _progress(task_id, "Converting GLB → OBJ (note: PBR materials will not be preserved)...")
+            import trimesh as _trimesh
+            mesh_obj = _trimesh.load(glb_path)
+            obj_tmp = tempfile.NamedTemporaryFile(suffix=".obj", delete=False)
+            out_path = obj_tmp.name
+            obj_tmp.close()
+            mesh_obj.export(out_path)
+            media_type = "text/plain"
+            filename = f"{stem}.obj"
+
+        elif fmt == "fbx":
+            _progress(task_id, "Converting GLB → FBX via Blender... (this can take 1-2 minutes, connection is kept alive)")
+            fbx_tmp = tempfile.NamedTemporaryFile(suffix=".fbx", delete=False)
+            out_path = fbx_tmp.name
+            fbx_tmp.close()
+            blender_script = "\n".join([
+                "import bpy",
+                "bpy.ops.wm.read_factory_settings(use_empty=True)",
+                f"bpy.ops.import_scene.gltf(filepath=r'{glb_path}')",
+                f"bpy.ops.export_scene.fbx(filepath=r'{out_path}', use_selection=False)",
+            ])
+            script_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False)
+            script_path = script_tmp.name
+            script_tmp.write(blender_script)
+            script_tmp.close()
+            result = subprocess.run(
+                ["blender", "--background", "--python", script_path],
+                capture_output=True, text=True, timeout=120,
+            )
+            _cleanup(script_path)
+            if result.returncode != 0:
+                raise RuntimeError(f"Blender FBX conversion failed: {result.stderr[-400:]}")
+            media_type = "application/octet-stream"
+            filename = f"{stem}.fbx"
+
+        else:
+            raise RuntimeError(f"Unknown format: {fmt}")
+
+        _progress(task_id, f"Done! {filename} is ready.")
+        with task["lock"]:
+            task["status"] = "done"
+            task["result_path"] = out_path
+            task["media_type"] = media_type
+            task["filename"] = filename
+
+    except Exception as e:
+        if out_path:
+            _cleanup(out_path)
+        _progress(task_id, f"ERROR: {e}")
+        with task["lock"]:
+            task["status"] = "error"
+            task["error"] = str(e)
+    finally:
+        _cleanup(glb_path)
+
+
+def _run_conversion_safe(task_id: str, glb_path: str, fmt: str, original_filename: str):
+    try:
+        _run_conversion(task_id, glb_path, fmt, original_filename)
+    except Exception as e:
+        task = tasks.get(task_id)
+        if task:
+            _progress(task_id, f"ERROR: {e}")
+            with task["lock"]:
+                task["status"] = "error"
+                task["error"] = str(e)
+
+
 @app.get("/health")
 def health():
     free = _free_vram_gb()
@@ -279,6 +355,39 @@ async def generate(
     loop.run_in_executor(
         executor, _run_generation_safe,
         task_id, img_tmp.name, format, image.filename or "model.png"
+    )
+
+    return {"task_id": task_id}
+
+
+@app.post("/convert")
+async def convert_glb(
+    glb: UploadFile = File(...),
+    format: str = Form(default="obj"),
+):
+    if format not in ("obj", "fbx"):
+        raise HTTPException(400, "format must be obj or fbx")
+
+    glb_bytes = await glb.read()
+    glb_tmp = tempfile.NamedTemporaryFile(suffix=".glb", delete=False)
+    glb_tmp.write(glb_bytes)
+    glb_tmp.close()
+
+    task_id = str(uuid.uuid4())
+    tasks[task_id] = {
+        "status": "running",
+        "messages": [],
+        "lock": threading.Lock(),
+        "result_path": None,
+        "media_type": None,
+        "filename": None,
+        "error": None,
+    }
+
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(
+        executor, _run_conversion_safe,
+        task_id, glb_tmp.name, format, glb.filename or "model.glb"
     )
 
     return {"task_id": task_id}
