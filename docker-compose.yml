@@ -11,6 +11,8 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - HF_HOME=/models/huggingface
       - TORCH_HOME=/models/torch
+      - HF_TOKEN=${HF_TOKEN}
+      - ATTN_BACKEND=sdpa
     restart: unless-stopped
     deploy:
       resources:

@@ -1,17 +1,27 @@
+import asyncio
 import gc
+import json
 import os
 import subprocess
 import tempfile
+import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
 from PIL import Image
 
-app = FastAPI(title="Wednesday 3D Modeling")
+app = FastAPI(title="Wednesday 3D Modeling — TRELLIS.2")
+executor = ThreadPoolExecutor(max_workers=1)
 
-TRELLIS_MIN_VRAM_GB = 20.0
+TRELLIS2_MIN_VRAM_GB = 20.0
+HF_MODEL = "microsoft/TRELLIS.2-4B"
+
+# task_id -> {status, messages, lock, result_path, media_type, filename, error}
+tasks: dict = {}
 
 
 def _free_vram_gb() -> float | None:
@@ -34,11 +44,185 @@ def _cleanup(*paths: str | None):
             pass
 
 
+def _progress(task_id: str, msg: str):
+    task = tasks.get(task_id)
+    if task:
+        with task["lock"]:
+            task["messages"].append(msg)
+
+
+def _run_generation(task_id: str, img_path: str, fmt: str, original_filename: str):
+    """Blocking generation — runs in thread pool executor. Loads and unloads model each call."""
+    task = tasks[task_id]
+    pipeline = None
+    glb_path = None
+
+    try:
+        _progress(task_id, "Checking VRAM...")
+        free_gb = _free_vram_gb()
+        if free_gb is not None and free_gb < TRELLIS2_MIN_VRAM_GB:
+            raise RuntimeError(
+                f"Insufficient VRAM ({free_gb:.1f} GB free, need {TRELLIS2_MIN_VRAM_GB} GB)."
+            )
+
+        _progress(task_id, f"VRAM OK ({free_gb:.1f} GB free). Clearing GPU cache...")
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        _progress(task_id, "Importing TRELLIS.2 pipeline...")
+        from trellis2.pipelines import Trellis2ImageTo3DPipeline
+        import o_voxel
+
+        _progress(task_id, f"Loading {HF_MODEL} (first run downloads ~15 GB, subsequent runs load from cache)...")
+        hf_token = os.environ.get("HF_TOKEN")
+        if not hf_token:
+            try:
+                hf_token = Path("/run/hf_token").read_text().strip() or None
+            except Exception:
+                pass
+        if hf_token:
+            os.environ["HF_TOKEN"] = hf_token
+
+        pipeline = Trellis2ImageTo3DPipeline.from_pretrained(HF_MODEL)
+        pipeline.cuda()
+
+        _progress(task_id, "Model loaded. Preprocessing image...")
+        img = Image.open(img_path).convert("RGBA")
+        img = pipeline.preprocess_image(img)
+
+        _progress(task_id, "Running 3D generation — Stage 1: Sparse structure...")
+        outputs, latents = pipeline.run(
+            img,
+            seed=1,
+            preprocess_image=False,
+            sparse_structure_sampler_params={
+                "steps": 12,
+                "guidance_strength": 7.5,
+                "guidance_rescale": 0.7,
+                "rescale_t": 5.0,
+            },
+            shape_slat_sampler_params={
+                "steps": 12,
+                "guidance_strength": 7.5,
+                "guidance_rescale": 0.5,
+                "rescale_t": 3.0,
+            },
+            tex_slat_sampler_params={
+                "steps": 12,
+                "guidance_strength": 1.0,
+                "guidance_rescale": 0.0,
+                "rescale_t": 3.0,
+            },
+            pipeline_type="1024_cascade",
+            return_latent=True,
+        )
+
+        _progress(task_id, "Stage 2: Decoding mesh with PBR materials...")
+        shape_slat, tex_slat, res = latents
+        mesh = pipeline.decode_latent(shape_slat, tex_slat, res)[0]
+
+        _progress(task_id, "Extracting GLB...")
+        glb_tmp = tempfile.NamedTemporaryFile(suffix=".glb", delete=False)
+        glb_path = glb_tmp.name
+        glb_tmp.close()
+
+        glb = o_voxel.postprocess.to_glb(
+            vertices=mesh.vertices,
+            faces=mesh.faces,
+            attr_volume=mesh.attrs,
+            coords=mesh.coords,
+            attr_layout=pipeline.pbr_attr_layout,
+            grid_size=res,
+            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            decimation_target=500000,
+            texture_size=2048,
+            remesh=True,
+            remesh_band=1,
+            remesh_project=0,
+        )
+        glb.export(glb_path, extension_webp=True)
+
+    finally:
+        if pipeline is not None:
+            del pipeline
+        torch.cuda.empty_cache()
+        gc.collect()
+        _cleanup(img_path)
+
+    # Format conversion (CPU-only from here)
+    stem = Path(original_filename).stem
+
+    if fmt == "glb":
+        out_path = glb_path
+        media_type = "model/gltf-binary"
+        filename = f"{stem}.glb"
+
+    elif fmt == "obj":
+        _progress(task_id, "Converting to OBJ (note: PBR materials will not be preserved)...")
+        import trimesh as _trimesh
+        mesh_obj = _trimesh.load(glb_path)
+        obj_tmp = tempfile.NamedTemporaryFile(suffix=".obj", delete=False)
+        out_path = obj_tmp.name
+        obj_tmp.close()
+        mesh_obj.export(out_path)
+        _cleanup(glb_path)
+        media_type = "text/plain"
+        filename = f"{stem}.obj"
+
+    elif fmt == "fbx":
+        _progress(task_id, "Converting to FBX via Blender...")
+        fbx_tmp = tempfile.NamedTemporaryFile(suffix=".fbx", delete=False)
+        out_path = fbx_tmp.name
+        fbx_tmp.close()
+        blender_script = "\n".join([
+            "import bpy",
+            "bpy.ops.wm.read_factory_settings(use_empty=True)",
+            f"bpy.ops.import_scene.gltf(filepath=r'{glb_path}')",
+            f"bpy.ops.export_scene.fbx(filepath=r'{out_path}', use_selection=False)",
+        ])
+        script_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False)
+        script_path = script_tmp.name
+        script_tmp.write(blender_script)
+        script_tmp.close()
+        result = subprocess.run(
+            ["blender", "--background", "--python", script_path],
+            capture_output=True, text=True, timeout=120,
+        )
+        _cleanup(glb_path, script_path)
+        if result.returncode != 0:
+            raise RuntimeError(f"Blender FBX conversion failed: {result.stderr[-400:]}")
+        media_type = "application/octet-stream"
+        filename = f"{stem}.fbx"
+
+    else:
+        raise RuntimeError(f"Unknown format: {fmt}")
+
+    _progress(task_id, f"Done! {filename} is ready.")
+    with task["lock"]:
+        task["status"] = "done"
+        task["result_path"] = out_path
+        task["media_type"] = media_type
+        task["filename"] = filename
+
+
+def _run_generation_safe(task_id: str, img_path: str, fmt: str, original_filename: str):
+    try:
+        _run_generation(task_id, img_path, fmt, original_filename)
+    except Exception as e:
+        task = tasks.get(task_id)
+        if task:
+            _progress(task_id, f"ERROR: {e}")
+            with task["lock"]:
+                task["status"] = "error"
+                task["error"] = str(e)
+
+
 @app.get("/health")
 def health():
     free = _free_vram_gb()
     return {
         "status": "ok",
+        "model": HF_MODEL,
         "cuda": torch.cuda.is_available(),
         "vram_free_gb": round(free, 1) if free is not None else None,
     }
@@ -69,112 +253,93 @@ def vram():
 
 @app.post("/generate")
 async def generate(
-    background_tasks: BackgroundTasks,
     image: UploadFile = File(...),
     format: str = Form(default="glb"),
 ):
     if format not in ("glb", "obj", "fbx"):
         raise HTTPException(400, "format must be glb, obj, or fbx")
 
-    # Check VRAM before attempting to load — fail fast if GPU is squatted
-    free_gb = _free_vram_gb()
-    if free_gb is not None and free_gb < TRELLIS_MIN_VRAM_GB:
-        raise HTTPException(
-            503,
-            f"Insufficient VRAM ({free_gb:.1f} GB free, need {TRELLIS_MIN_VRAM_GB} GB). "
-            "Another process may be occupying GPU memory. Free VRAM and retry.",
-        )
-
-    # Clear any cached tensors from previous runs in this process
-    torch.cuda.empty_cache()
-    gc.collect()
-
-    # Save uploaded image
+    img_bytes = await image.read()
     img_tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-    img_tmp.write(await image.read())
+    img_tmp.write(img_bytes)
     img_tmp.close()
-    img_path = img_tmp.name
 
-    glb_path: str | None = None
-    out_path: str | None = None
-    pipeline = None
+    task_id = str(uuid.uuid4())
+    tasks[task_id] = {
+        "status": "running",
+        "messages": [],
+        "lock": threading.Lock(),
+        "result_path": None,
+        "media_type": None,
+        "filename": None,
+        "error": None,
+    }
 
-    try:
-        from trellis.pipelines import TrellisImageTo3DPipeline
-        from trellis.utils import postprocessing_utils
-
-        pipeline = TrellisImageTo3DPipeline.from_pretrained("microsoft/TRELLIS-image-large")
-        pipeline.cuda()
-
-        img = Image.open(img_path).convert("RGBA")
-        outputs = pipeline.run(img, seed=1)
-
-        glb_tmp = tempfile.NamedTemporaryFile(suffix=".glb", delete=False)
-        glb_path = glb_tmp.name
-        glb_tmp.close()
-
-        glb = postprocessing_utils.to_glb(outputs["gaussian"][0], outputs["mesh"][0])
-        glb.export(glb_path)
-
-    finally:
-        # Always unload model and clear GPU memory after generation
-        if pipeline is not None:
-            del pipeline
-        torch.cuda.empty_cache()
-        gc.collect()
-
-    # Format conversion (CPU-only from here)
-    extra_cleanup: list[str | None] = [img_path]
-
-    if format == "glb":
-        out_path = glb_path
-        media_type = "model/gltf-binary"
-        out_suffix = ".glb"
-
-    elif format == "obj":
-        import trimesh as _trimesh
-        mesh = _trimesh.load(glb_path)
-        obj_tmp = tempfile.NamedTemporaryFile(suffix=".obj", delete=False)
-        out_path = obj_tmp.name
-        obj_tmp.close()
-        mesh.export(out_path)
-        extra_cleanup.append(glb_path)
-        media_type = "text/plain"
-        out_suffix = ".obj"
-
-    elif format == "fbx":
-        fbx_tmp = tempfile.NamedTemporaryFile(suffix=".fbx", delete=False)
-        out_path = fbx_tmp.name
-        fbx_tmp.close()
-
-        blender_script = "\n".join([
-            "import bpy",
-            "bpy.ops.wm.read_factory_settings(use_empty=True)",
-            f"bpy.ops.import_scene.gltf(filepath=r'{glb_path}')",
-            f"bpy.ops.export_scene.fbx(filepath=r'{out_path}', use_selection=False)",
-        ])
-        script_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False)
-        script_path = script_tmp.name
-        script_tmp.write(blender_script)
-        script_tmp.close()
-        extra_cleanup += [glb_path, script_path]
-
-        result = subprocess.run(
-            ["blender", "--background", "--python", script_path],
-            capture_output=True, text=True, timeout=120,
-        )
-        if result.returncode != 0:
-            background_tasks.add_task(_cleanup, *extra_cleanup, out_path)
-            raise HTTPException(500, f"Blender FBX conversion failed: {result.stderr[-400:]}")
-
-        media_type = "application/octet-stream"
-        out_suffix = ".fbx"
-
-    stem = Path(image.filename or "model").stem
-    background_tasks.add_task(_cleanup, *extra_cleanup, out_path)
-
-    return FileResponse(
-        out_path,
-        media_type=media_type,
-        filename=f"{stem}{out_suffix}",
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(
+        executor, _run_generation_safe,
+        task_id, img_tmp.name, format, image.filename or "model.png"
     )
+
+    return {"task_id": task_id}
+
+
+@app.get("/progress/{task_id}")
+async def progress_stream(task_id: str):
+    if task_id not in tasks:
+        raise HTTPException(404, "Task not found")
+
+    task = tasks[task_id]
+
+    async def event_gen():
+        sent = 0
+        while True:
+            with task["lock"]:
+                new_msgs = task["messages"][sent:]
+                status = task["status"]
+
+            for msg in new_msgs:
+                sent += 1
+                yield f"data: {json.dumps({'type': 'progress', 'msg': msg})}\n\n"
+
+            if status == "done":
+                with task["lock"]:
+                    fn = task["filename"]
+                yield f"data: {json.dumps({'type': 'done', 'filename': fn})}\n\n"
+                break
+            elif status == "error":
+                with task["lock"]:
+                    err = task["error"]
+                yield f"data: {json.dumps({'type': 'error', 'msg': err})}\n\n"
+                break
+
+            await asyncio.sleep(0.4)
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/result/{task_id}")
+async def get_result(task_id: str):
+    task = tasks.get(task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    with task["lock"]:
+        status = task["status"]
+        path = task["result_path"]
+        media_type = task["media_type"]
+        filename = task["filename"]
+    if status != "done" or not path:
+        raise HTTPException(404, "Result not ready")
+
+    async def cleanup_task():
+        await asyncio.sleep(300)
+        _cleanup(path)
+        tasks.pop(task_id, None)
+
+    asyncio.create_task(cleanup_task())
+
+    return FileResponse(path, media_type=media_type, filename=filename)
