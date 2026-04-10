@@ -170,7 +170,7 @@ def _run_generation(task_id: str, img_path: str, fmt: str, original_filename: st
         filename = f"{stem}.obj"
 
     elif fmt == "fbx":
-        _progress(task_id, "Converting to FBX via Blender...")
+        _progress(task_id, "Converting to FBX via Blender... (this can take 1-2 minutes, connection is kept alive)")
         fbx_tmp = tempfile.NamedTemporaryFile(suffix=".fbx", delete=False)
         out_path = fbx_tmp.name
         fbx_tmp.close()
@@ -293,14 +293,23 @@ async def progress_stream(task_id: str):
 
     async def event_gen():
         sent = 0
+        idle_ticks = 0
         while True:
             with task["lock"]:
                 new_msgs = task["messages"][sent:]
                 status = task["status"]
 
-            for msg in new_msgs:
-                sent += 1
-                yield f"data: {json.dumps({'type': 'progress', 'msg': msg})}\n\n"
+            if new_msgs:
+                idle_ticks = 0
+                for msg in new_msgs:
+                    sent += 1
+                    yield f"data: {json.dumps({'type': 'progress', 'msg': msg})}\n\n"
+            else:
+                idle_ticks += 1
+                # Send SSE comment keepalive every ~5s to prevent Traefik from
+                # closing the idle connection during long operations (e.g. Blender FBX)
+                if idle_ticks % 13 == 0:
+                    yield ": keepalive\n\n"
 
             if status == "done":
                 with task["lock"]:
