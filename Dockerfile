@@ -67,6 +67,7 @@ RUN pip install /opt/trellis2/o-voxel --no-build-isolation
 COPY patch_trellis2_attn.py /tmp/
 RUN python3 /tmp/patch_trellis2_attn.py
 
+
 # FastAPI service
 RUN pip install --no-cache-dir fastapi "uvicorn[standard]" python-multipart
 

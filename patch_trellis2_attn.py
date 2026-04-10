@@ -1,6 +1,7 @@
 """
-Patch TRELLIS.2 attention modules to support PyTorch sdpa (scaled_dot_product_attention).
-Required for sm_120 (RTX Pro 6000 Blackwell) — flash_attn v2 has no sm_120 support.
+Patch TRELLIS.2 for RTX Pro 6000 Blackwell (sm_120) compatibility:
+1. Attention: replace flash_attn default with sdpa (flash_attn v2 has no sm_120 support)
+2. rembg: substitute briaai/RMBG-2.0 (gated) with ZhengPeng7/BiRefNet (public upstream)
 """
 import os
 
@@ -118,5 +119,41 @@ WIN_REPLACE = """\
 
 sed(p, WIN_ANCHOR, WIN_REPLACE)
 print("windowed_attn.py: OK")
+
+
+# ── 4. Replace BiRefNet.py with rembg-based implementation ───────────────────
+# briaai/RMBG-2.0 and ZhengPeng7/BiRefNet are both gated or load gated deps.
+# The rembg Python package (already installed) uses ONNX/u2net — no HF gate.
+BIREFNET_NEW = '''\
+from typing import *
+from PIL import Image
+
+
+class BiRefNet:
+    """
+    Background removal using the rembg package (isnet-general-use ONNX).
+    Drop-in replacement for briaai/RMBG-2.0 — no gated HF model required.
+    """
+    def __init__(self, model_name: str = "isnet-general-use", **kwargs):
+        from rembg import new_session
+        self._session = new_session(
+            model_name if "RMBG" not in model_name and "BiRefNet" not in model_name
+            else "isnet-general-use"
+        )
+
+    def to(self, device):
+        return self  # rembg uses ONNX/CPU — device is a no-op
+
+    def cpu(self):
+        return self
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        from rembg import remove
+        return remove(image, session=self._session)
+'''
+
+with open('/opt/trellis2/trellis2/pipelines/rembg/BiRefNet.py', 'w') as f:
+    f.write(BIREFNET_NEW)
+print("BiRefNet.py: OK")
 
 print("All patches applied.")
