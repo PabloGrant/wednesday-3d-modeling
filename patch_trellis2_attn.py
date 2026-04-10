@@ -156,4 +156,12 @@ with open('/opt/trellis2/trellis2/pipelines/rembg/BiRefNet.py', 'w') as f:
     f.write(BIREFNET_NEW)
 print("BiRefNet.py: OK")
 
+# ── 5. Fix DINOv3ViTModel layer path in DinoV3FeatureExtractor ───────────────
+# DINOv3ViTModel wraps DINOv3ViTEncoder at .model; layers are at .model.model.layer
+p = '/opt/trellis2/trellis2/modules/image_feature_extractor.py'
+sed(p,
+    "        for i, layer_module in enumerate(self.model.layer):",
+    "        for i, layer_module in enumerate(self.model.model.layer):")
+print("image_feature_extractor.py: OK")
+
 print("All patches applied.")
