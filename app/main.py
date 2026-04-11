@@ -183,6 +183,15 @@ def _run_generation(task_id: str, img_path: str, fmt: str, original_filename: st
         gc.collect()
         _cleanup(img_path)
 
+    # Hard post-process decimation: o_voxel's decimation_target is a hint and
+    # the remesh step can overshoot it. Enforce the cap on the exported GLB.
+    if decimation_target < 100000:
+        _progress(task_id, f"Enforcing ≤{decimation_target} triangle cap on exported mesh...")
+        capped = _decimate_scene(glb_path, decimation_target)
+        if capped != glb_path:
+            _cleanup(glb_path)
+            glb_path = capped
+
     # Format conversion (CPU-only from here)
     stem = Path(original_filename).stem
 
