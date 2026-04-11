@@ -44,6 +44,40 @@ def _cleanup(*paths: str | None):
             pass
 
 
+def _strip_webp_from_glb(glb_path: str) -> str:
+    """Re-export GLB via trimesh to convert WebP textures → PNG (Blender compat)."""
+    import trimesh as _trimesh
+    scene = _trimesh.load(glb_path, process=False)
+    tmp = tempfile.NamedTemporaryFile(suffix=".glb", delete=False)
+    out_path = tmp.name
+    tmp.close()
+    scene.export(out_path)
+    return out_path
+
+
+def _decimate_scene(glb_path: str, max_triangles: int) -> str:
+    """Load GLB, decimate to max_triangles total faces, re-export. Returns new path."""
+    import trimesh as _trimesh
+    scene = _trimesh.load(glb_path, process=False)
+    geoms = scene.geometry if isinstance(scene, _trimesh.Scene) else {"mesh": scene}
+    total = sum(len(g.faces) for g in geoms.values() if hasattr(g, "faces"))
+    if total <= max_triangles:
+        return glb_path
+    ratio = max_triangles / total
+    if isinstance(scene, _trimesh.Scene):
+        for name, geom in scene.geometry.items():
+            if hasattr(geom, "faces") and len(geom.faces) > 4:
+                target = max(4, int(len(geom.faces) * ratio))
+                scene.geometry[name] = geom.simplify_quadric_decimation(target)
+    else:
+        scene = scene.simplify_quadric_decimation(max(4, int(total * ratio)))
+    tmp = tempfile.NamedTemporaryFile(suffix=".glb", delete=False)
+    out_path = tmp.name
+    tmp.close()
+    scene.export(out_path)
+    return out_path
+
+
 def _progress(task_id: str, msg: str):
     task = tasks.get(task_id)
     if task:
@@ -51,7 +85,7 @@ def _progress(task_id: str, msg: str):
             task["messages"].append(msg)
 
 
-def _run_generation(task_id: str, img_path: str, fmt: str, original_filename: str):
+def _run_generation(task_id: str, img_path: str, fmt: str, original_filename: str, decimation_target: int = 500000):
     """Blocking generation — runs in thread pool executor. Loads and unloads model each call."""
     task = tasks[task_id]
     pipeline = None
@@ -134,7 +168,7 @@ def _run_generation(task_id: str, img_path: str, fmt: str, original_filename: st
             attr_layout=pipeline.pbr_attr_layout,
             grid_size=res,
             aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-            decimation_target=500000,
+            decimation_target=decimation_target,
             texture_size=2048,
             remesh=True,
             remesh_band=1,
@@ -174,10 +208,12 @@ def _run_generation(task_id: str, img_path: str, fmt: str, original_filename: st
         fbx_tmp = tempfile.NamedTemporaryFile(suffix=".fbx", delete=False)
         out_path = fbx_tmp.name
         fbx_tmp.close()
+        _progress(task_id, "Preparing GLB for Blender (converting WebP textures)...")
+        blender_glb = _strip_webp_from_glb(glb_path)
         blender_script = "\n".join([
             "import bpy",
             "bpy.ops.wm.read_factory_settings(use_empty=True)",
-            f"bpy.ops.import_scene.gltf(filepath=r'{glb_path}')",
+            f"bpy.ops.import_scene.gltf(filepath=r'{blender_glb}')",
             f"bpy.ops.export_scene.fbx(filepath=r'{out_path}', use_selection=False)",
         ])
         script_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False)
@@ -188,7 +224,7 @@ def _run_generation(task_id: str, img_path: str, fmt: str, original_filename: st
             ["blender", "--background", "--python", script_path],
             capture_output=True, text=True, timeout=120,
         )
-        _cleanup(glb_path, script_path)
+        _cleanup(glb_path, blender_glb, script_path)
         if result.returncode != 0:
             raise RuntimeError(f"Blender FBX conversion failed: {result.stderr[-400:]}")
         media_type = "application/octet-stream"
@@ -205,9 +241,9 @@ def _run_generation(task_id: str, img_path: str, fmt: str, original_filename: st
         task["filename"] = filename
 
 
-def _run_generation_safe(task_id: str, img_path: str, fmt: str, original_filename: str):
+def _run_generation_safe(task_id: str, img_path: str, fmt: str, original_filename: str, decimation_target: int = 500000):
     try:
-        _run_generation(task_id, img_path, fmt, original_filename)
+        _run_generation(task_id, img_path, fmt, original_filename, decimation_target)
     except Exception as e:
         task = tasks.get(task_id)
         if task:
@@ -217,12 +253,20 @@ def _run_generation_safe(task_id: str, img_path: str, fmt: str, original_filenam
                 task["error"] = str(e)
 
 
-def _run_conversion(task_id: str, glb_path: str, fmt: str, original_filename: str):
+def _run_conversion(task_id: str, glb_path: str, fmt: str, original_filename: str, max_triangles: int = 0):
     """Convert an existing GLB to obj or fbx. No GPU needed."""
     task = tasks[task_id]
     out_path = None
     try:
         stem = Path(original_filename).stem
+
+        # Optional decimation before conversion
+        if max_triangles > 0:
+            _progress(task_id, f"Decimating mesh to ≤{max_triangles} triangles...")
+            decimated = _decimate_scene(glb_path, max_triangles)
+            if decimated != glb_path:
+                _cleanup(glb_path)
+                glb_path = decimated
 
         if fmt == "obj":
             _progress(task_id, "Converting GLB → OBJ (note: PBR materials will not be preserved)...")
@@ -240,10 +284,12 @@ def _run_conversion(task_id: str, glb_path: str, fmt: str, original_filename: st
             fbx_tmp = tempfile.NamedTemporaryFile(suffix=".fbx", delete=False)
             out_path = fbx_tmp.name
             fbx_tmp.close()
+            _progress(task_id, "Preparing GLB for Blender (converting WebP textures)...")
+            blender_glb = _strip_webp_from_glb(glb_path)
             blender_script = "\n".join([
                 "import bpy",
                 "bpy.ops.wm.read_factory_settings(use_empty=True)",
-                f"bpy.ops.import_scene.gltf(filepath=r'{glb_path}')",
+                f"bpy.ops.import_scene.gltf(filepath=r'{blender_glb}')",
                 f"bpy.ops.export_scene.fbx(filepath=r'{out_path}', use_selection=False)",
             ])
             script_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False)
@@ -254,7 +300,7 @@ def _run_conversion(task_id: str, glb_path: str, fmt: str, original_filename: st
                 ["blender", "--background", "--python", script_path],
                 capture_output=True, text=True, timeout=120,
             )
-            _cleanup(script_path)
+            _cleanup(blender_glb, script_path)
             if result.returncode != 0:
                 raise RuntimeError(f"Blender FBX conversion failed: {result.stderr[-400:]}")
             media_type = "application/octet-stream"
@@ -281,9 +327,9 @@ def _run_conversion(task_id: str, glb_path: str, fmt: str, original_filename: st
         _cleanup(glb_path)
 
 
-def _run_conversion_safe(task_id: str, glb_path: str, fmt: str, original_filename: str):
+def _run_conversion_safe(task_id: str, glb_path: str, fmt: str, original_filename: str, max_triangles: int = 0):
     try:
-        _run_conversion(task_id, glb_path, fmt, original_filename)
+        _run_conversion(task_id, glb_path, fmt, original_filename, max_triangles)
     except Exception as e:
         task = tasks.get(task_id)
         if task:
@@ -331,6 +377,7 @@ def vram():
 async def generate(
     image: UploadFile = File(...),
     format: str = Form(default="glb"),
+    decimation_target: int = Form(default=500000),
 ):
     if format not in ("glb", "obj", "fbx"):
         raise HTTPException(400, "format must be glb, obj, or fbx")
@@ -354,7 +401,7 @@ async def generate(
     loop = asyncio.get_event_loop()
     loop.run_in_executor(
         executor, _run_generation_safe,
-        task_id, img_tmp.name, format, image.filename or "model.png"
+        task_id, img_tmp.name, format, image.filename or "model.png", decimation_target
     )
 
     return {"task_id": task_id}
@@ -364,6 +411,7 @@ async def generate(
 async def convert_glb(
     glb: UploadFile = File(...),
     format: str = Form(default="obj"),
+    max_triangles: int = Form(default=0),
 ):
     if format not in ("obj", "fbx"):
         raise HTTPException(400, "format must be obj or fbx")
@@ -387,7 +435,7 @@ async def convert_glb(
     loop = asyncio.get_event_loop()
     loop.run_in_executor(
         executor, _run_conversion_safe,
-        task_id, glb_tmp.name, format, glb.filename or "model.glb"
+        task_id, glb_tmp.name, format, glb.filename or "model.glb", max_triangles
     )
 
     return {"task_id": task_id}
