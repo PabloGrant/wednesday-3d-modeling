@@ -223,7 +223,7 @@ def _run_generation(task_id: str, img_path: str, fmt: str, original_filename: st
             "import bpy",
             "bpy.ops.wm.read_factory_settings(use_empty=True)",
             f"bpy.ops.import_scene.gltf(filepath=r'{blender_glb}')",
-            f"bpy.ops.export_scene.fbx(filepath=r'{out_path}', use_selection=False)",
+            f"bpy.ops.export_scene.fbx(filepath=r'{out_path}', use_selection=False, path_mode='COPY', embed_textures=True)",
         ])
         script_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False)
         script_path = script_tmp.name
@@ -299,7 +299,7 @@ def _run_conversion(task_id: str, glb_path: str, fmt: str, original_filename: st
                 "import bpy",
                 "bpy.ops.wm.read_factory_settings(use_empty=True)",
                 f"bpy.ops.import_scene.gltf(filepath=r'{blender_glb}')",
-                f"bpy.ops.export_scene.fbx(filepath=r'{out_path}', use_selection=False)",
+                f"bpy.ops.export_scene.fbx(filepath=r'{out_path}', use_selection=False, path_mode='COPY', embed_textures=True)",
             ])
             script_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False)
             script_path = script_tmp.name
